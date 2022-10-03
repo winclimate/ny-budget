@@ -1,0 +1,246 @@
+---
+title: "New York Climate Budget"
+author: "Win Climatae"
+date: "9/30/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(FinancialMath)
+library(units)
+library(DiagrammeR)
+library(DiagrammeRsvg)
+library(rsvg)
+install_unit("dollar")
+install_unit("kWh")
+```
+
+## R Markdown
+
+```{r}
+#' Subjective value of a loss; vectorized
+#' Linear until the switch point, then exponential from there
+subjective_value <- function(initial_price, lifetime, item_old, switchpoint, year) {
+    # calculate the linear values
+    yearly_linear_decrease <- initial_price/lifetime
+    linear_value <- initial_price - (yearly_linear_decrease * year)
+
+    # calculate the exponential values
+    cutover <- initial_price - (yearly_linear_decrease * switchpoint)
+    years_left <- item_old - switchpoint
+    scrap_value <- 100
+    rate <- log(scrap_value / cutover) / years_left
+    exponential_value <- cutover * exp(rate * (year-switchpoint))
+
+    ifelse(year < switchpoint, linear_value, exponential_value)
+}
+
+ggplot() + stat_function(fun = ~ subjective_value(10000, 25, 20, 10, .x)) + xlim(0,25)
+```
+
+```{r}
+dot <- {"digraph {
+  rankdir=\"BT\"
+  node [shape=box]
+  boiler_lifetime
+  boiler_old_at
+  boiler_years_left
+  boiler_cost
+  subjective_boiler_value
+  yearly_propane_cost
+  yearly_boiler_maintenance
+  yearly_boiler_total_cost
+  heatpump_installation_cost
+  yearly_heatpump_maintenance
+  hspf
+  heatpump_btus
+  yearly_heatpump_btus
+  heatpump_kwh
+  yearly_electricity_cost
+  investment
+  yearly_savings
+  yearly_heatpump_total_cost
+  payback_threshold
+  payback
+  investment_with_subsidy
+  payback_with_subsidy
+  buy_heatpump_no_subsidy
+  buy_heatpump_with_subsidy
+  subsidy_effective
+  co2
+  co2_saved [style=\"filled\", color=\"green\"]
+  yearly_propane_usage
+
+  
+  node [shape=circle]
+  house_sqft
+  house_age
+  boiler_age
+  boiler_cost_sqft
+  household_thinks_boiler_is_old_at
+  propane_cost
+  heatpump_cost_sqft
+  heating_hours
+  eletricity_cost
+  incentive [style=\"filled\", color=\"yellow\"]
+  subsidy
+
+  house_age -> boiler_age
+  boiler_lifetime -> {boiler_years_left, boiler_age}
+  {house_sqft, boiler_cost_sqft} -> boiler_cost
+  boiler_age -> boiler_years_left
+  household_thinks_boiler_is_old_at -> subjective_boiler_value
+  boiler_years_left -> subjective_boiler_value
+  boiler_old_at -> subjective_boiler_value
+  boiler_cost -> subjective_boiler_value
+  house_sqft -> yearly_propane_usage
+  propane_cost -> yearly_propane_cost
+  yearly_propane_usage -> yearly_propane_cost
+  yearly_boiler_maintenance -> yearly_boiler_total_cost
+  yearly_propane_cost -> yearly_boiler_total_cost
+  house_sqft -> heatpump_installation_cost
+  heatpump_cost_sqft -> heatpump_installation_cost
+  house_sqft -> heatpump_btus
+  heating_hours -> yearly_heatpump_btus
+  heatpump_btus -> yearly_heatpump_btus
+  yearly_heatpump_btus -> heatpump_kwh
+  hspf -> heatpump_kwh
+  heatpump_kwh -> yearly_electricity_cost
+  eletricity_cost -> yearly_electricity_cost
+  yearly_electricity_cost -> yearly_heatpump_total_cost
+  yearly_heatpump_maintenance -> yearly_heatpump_total_cost
+  subjective_boiler_value -> investment
+  heatpump_installation_cost -> investment
+  yearly_heatpump_total_cost -> yearly_savings
+  yearly_boiler_total_cost -> yearly_savings
+  investment -> payback
+  yearly_savings -> payback
+  incentive -> subsidy
+  heatpump_btus -> subsidy
+  subsidy -> investment_with_subsidy
+  investment_with_subsidy -> payback_with_subsidy
+  yearly_savings -> payback_with_subsidy
+  payback_with_subsidy -> buy_heatpump_with_subsidy
+  payback -> buy_heatpump_no_subsidy
+  buy_heatpump_with_subsidy -> subsidy_effective
+  buy_heatpump_no_subsidy -> subsidy_effective
+  yearly_propane_usage -> co2
+  co2 -> co2_saved
+  subsidy_effective -> co2_saved
+  investment -> investment_with_subsidy
+  payback_threshold -> {buy_heatpump_no_subsidy, buy_heatpump_with_subsidy}
+}"}
+
+grViz(dot) %>% export_svg %>% charToRaw %>% rsvg_pdf("/mnt/heatpump.pdf")
+
+grViz(dot)
+```
+
+
+```{r}
+#' Simulate a household deciding whether or not to upgrade its utilities
+#' @param n number of households to simulate
+
+sim_households <- function(n) {
+  tibble(
+    row_id = 1:n,
+    house_sqft = runif(n, 1000, 4000) %>% as_units("ft^2"),
+    house_age = runif(n, 1, 100) %>% as_units("year"),
+    boiler_lifetime = 20 %>% as_units("year"), # from simulation data
+    boiler_old_at = 15 %>% as_units("year"),
+    boiler_age = runif(n, 1, min(house_age,boiler_lifetime)) %>% as_units("year"),
+    boiler_years_left = boiler_lifetime - boiler_age,
+    boiler_cost_sqft = runif(n, 3, 8) %>% as_units("dollar/ft^2"),
+    boiler_cost = house_sqft * boiler_cost_sqft,
+    household_thinks_boilers_is_old_at = runif(n, 7, 15) %>% as_units("years"),
+    subjective_boiler_value = subjective_value(initial_price = boiler_cost, 
+                                               lifetime = boiler_lifetime,
+                                               item_old = boiler_old_at,
+                                               switchpoint = household_thinks_boilers_is_old_at,
+                                               year = boiler_age) %>% as_units("dollar"),
+    yearly_propane_usage = as_units(.44, "gallons/ft^2") * house_sqft,
+    propane_cost = runif(n, 3, 4) %>% as_units("dollar/gallon"),
+    yearly_propane_cost = yearly_propane_usage * propane_cost,
+    yearly_boiler_maintenance = as_units(250, "dollar"),
+    yearly_boiler_total_cost = (yearly_propane_cost + yearly_boiler_maintenance),
+    #ac_years_left = runinf(n, 1, 20) %>% as_units("year"), # TODO AC
+    heatpump_cost_sqft = runif(n, 12, 20) %>% as_units("dollar/ft^2"),
+    heatpump_installation_cost = heatpump_cost_sqft * house_sqft,
+    yearly_heatpump_maintenance = as_units(100, "dollar"),
+    hspf = as_units(10*1000, "btu/kWh"), # Wh -> kWh
+    heating_hours = runif(n, 2000, 3000), # better to breakdown by zone
+    heatpump_btus = house_sqft * as_units(10, "btu/ft^2"),
+    yearly_heatpump_btus = heatpump_btus * heating_hours,
+    heatpump_kwh = yearly_heatpump_btus / hspf,
+    eletricity_cost = runif(n, .1, .2) %>% as_units("dollar/kWh"),
+    yearly_electricity_cost = heatpump_kwh * eletricity_cost,
+    yearly_heatpump_total_cost = yearly_electricity_cost + yearly_heatpump_maintenance,
+    investment = subjective_boiler_value + heatpump_installation_cost,
+    yearly_savings = yearly_boiler_total_cost - yearly_heatpump_total_cost,
+    payback_threshold = purrr::rdunif(n, 1, 10) %>% as_units("1"), # so we don't need to carry /yr downstream
+    payback = investment / yearly_savings,
+    buy_heatpump_no_subsidy = payback < payback_threshold,
+    incentive = (purrr::rdunif(n, 2, 7) / 10) %>% as_units("dollar/BTU"), # https://www.coned.com/-/media/files/coned/documents/save-energy-money/rebates-incentives-tax-credits/rebates-incentives-tax-credits-for-commercial-industrial-buildings-customers/clean-heat/clean-heat-program-guide.pdf?la=en
+    subsidy = incentive * heatpump_btus,
+    investment_with_subsidy = investment - subsidy,
+    payback_with_subsidy = investment_with_subsidy / yearly_savings,
+    buy_heatpump_with_subsidy = payback_with_subsidy < payback_threshold,
+    subsidy_effective = buy_heatpump_with_subsidy & !buy_heatpump_no_subsidy,
+    actual_subsidy = ifelse(subsidy_effective, subsidy, 0),
+    co2 = as_units(12.68,"lb/gallon") * yearly_propane_usage, # https://www.eia.gov/environment/emissions/co2_vol_mass.php
+    co2_saved = ifelse(subsidy_effective, co2, 0) %>% as_units("lb")
+  )
+}
+
+sim_households(10)
+```
+
+```{r}
+hh <- sim_households(1000000) #1m households
+```
+
+```{r}
+# Clean Heat 2021 actuals https://documents.dps.ny.gov/public/Common/ViewDoc.aspx?DocRefId=%7B315D85D9-3E3B-43D8-BFCB-2DA89144FE94%7D
+# $0.2/BTU incentive led to 10,691 whole-load ASHP (w or w/o hot water) installations in 2021
+
+ff_ny_households = 2.6e6 # from NYS CAC Draft Scoping Plan, Tech Supplement Annex 1, Bldg_Res Stock
+
+hp_res <- hh %>% 
+  group_by(incentive) %>%
+  summarise(n = n(),
+            rescale = ff_ny_households / n(),
+            num_hh_subsidized = rescale * sum(subsidy_effective),
+            co2_saved = (rescale * sum(co2_saved)),
+            mt_co2_saved = co2_saved / (1e6*2204),
+            avg_co2_saved = co2_saved / num_hh_subsidized,
+            pct_hh_heatpumps = (num_hh_subsidized / ff_ny_households) * 100,
+            total_subsidy_megadollars = rescale * sum(actual_subsidy) / 1e6,
+            mtco2_saved_per_megadollar = mt_co2_saved / total_subsidy_megadollars,
+            avg_subsidy = (total_subsidy_megadollars * 1e6) / num_hh_subsidized)
+
+hp_res
+```
+
+```{r}
+hp_res %>%
+  ggplot(aes(x=total_subsidy_megadollars, y=mtco2_saved_per_megadollar, label=incentive)) +
+  geom_line() +
+  geom_label() +
+  ggtitle("Marginal effectiveness of different subsidy levels on ASHP adoption")
+```
+
+```{r}
+hp_res %>%
+  ggplot(aes(x=total_subsidy_megadollars, y=co2_saved, label=incentive)) +
+  geom_line() +
+  geom_label() +
+  ggtitle("Total effectiveness of different subsidy levels on ASHP adoption")
+```
+
+```{r}
+#' Allocate money based on possible goals
+#' Spend should be a table with 
+budget <- function(spend, budget)
+```
