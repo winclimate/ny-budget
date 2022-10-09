@@ -33,8 +33,7 @@ $X_{ij}$ is a scaling factor; we can calculate it with some algebra by knowing t
 $$
 \begin{align*}
 M_{ij}&=X_{ij} 100^{-\eta_{ij}}\\
-\frac{M_{ij}}{100^{-\eta_{ij}}}&=X_{ij}\\
-100^{\eta_{ij}}M_{ij}&=X_{ij}
+\frac{M_{ij}}{100^{\eta_{ij}}}&=X_ij
 \end{align*}
 $$
 
@@ -43,14 +42,14 @@ $$
 For example, if $X_{11} = 1,000,000$ middle-income households could buy a heat pump next year, and $\eta_{11} = .001$ is the price elasticity of demand for that market, then the number of heat pumps purchased by middle-income households as a function of price would be described as follows (note that we're putting price on the x axis and quantity on the y axis, which is not normal in economics but more sensible to me and probably to other outsiders):
 
 ```{r}
-# Define our quantity as a function of price, M and eta
-q <- function(M, eta, p) {(100^eta*M) * p^(-eta)}
+# Define our quantity as a function of price, X and eta
+q <- function(X, eta, p) {X * p^(-eta)}
 ```
 
 To visualize:
 ```{r}
 ggplot() +
-  geom_function(fun = ~q(1000000, 1, .x), xlim = c(100,10000)) +
+  geom_function(fun = ~q(1000000, .01, .x), xlim = c(10,10000)) +
   xlab("Price") +
   ylab("Qty")
 ```
