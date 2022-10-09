@@ -3,9 +3,9 @@ title: "New York Climate Budget Optimization Proof of Concept"
 author: "Max Shron"
 date: "10/7/2022"
 output:
-  word_document: default
-  pdf_document: default
   html_document: default
+  pdf_document: default
+  word_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -43,13 +43,13 @@ For example, if $X_{11} = 1,000,000$ middle-income households could buy a heat p
 
 ```{r}
 # Define our quantity as a function of price, X and eta
-q <- function(X, eta, p) {X * p^(-eta)}
+q <- function(X, eta, p) {X * exp(-eta * p)}
 ```
 
 To visualize:
 ```{r}
 ggplot() +
-  geom_function(fun = ~q(1000000, .01, .x), xlim = c(10,10000)) +
+  geom_function(fun = ~q(1000000, .001, .x), xlim = c(10,10000)) +
   xlab("Price") +
   ylab("Qty")
 ```
