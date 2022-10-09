@@ -1,36 +1,61 @@
 ---
-title: "New York Climate Budget Optimization"
+title: "New York Climate Budget Optimization Proof of Concept"
 author: "Max Shron"
 date: "10/7/2022"
-output: html_document
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
-library(nloptr)
+library(lpSolve)
 ```
 
-## Setup
+### Setup
 
-Taking a step back from the specifics of our real budget, suppose there are two products (Heat Pumps and Solar Arrays) in two markets (mid-income and low-income). Each of them reduces green-house gases (GHG) by a fixed amount per product.
+Let's take a step back from the problem of optimizing a real budget, and instead talk about trying to optimize a simplified one with four programs.
 
-We have four programs that can subsidize those products (HeatMid, HeatLow, SolarMid, SolarLow), which specialize in subsidizing each combination (so HeatMid subsidizes heat pumps for middle-income households, and so on). How much should we subsidize each product to minimize GHG overall?
+Making up some program names, let's say we have HeatMid and HeatLow, which subsidize middle-income and low-income heat pumps respectively, and SolarMid and SolarLow, which do similar for rooftop solar. Two products, four programs, and for each we need to choose a subsidy level subject to an overall budget constraint.
 
-To formalize this, let's index each product with an integer (e.g. Heat Pump = 1, Solar Arrays = 2), and similarly for each market. So, if subsidy is $s$, then $s_{ij}$ is the subsidy offered for good $i$ in market $j$.
+Our objective is to maximize the green-house gas (GHG) savings caused by the money spent on each program, by and large CO2. How many incremental heat pumps and solar installations can we incentivize?
 
-Let $Q_{ij}(p)$ be the quantity of product $i$ which is purchased in market $j$ at price $p$. In keeping with a standard log-log form of the demand curve, for now let's say that $Q_{ij}(p) = X_{ij} e^{-\eta_{i}p}$, where $\eta_{ij}$ is the price elasticity of demand for product $i$ in market $j$. $X_{ij}$ is the quantity of people who would purchase the product if the price was free (that is, the total addressable market).
+### Formalization
 
-For example, if $X_{11} = 1,000,000$ and $\eta_{11} = .001$, then the number of heat pumps purchased by middle-income households as a function of price would be described as follows (note that we're putting price on the x axis and quantity on the y axis, which is not normal in economics but more sensible to outsiders):
+We have two products, so let's index each product with an integer (e.g. Heat Pump = 1, Solar Arrays = 2). We do similarly for each market (middle income households vs low income households). Then the subsidy $s_{ij}$ is the subsidy offered by a given program to subsidize good $i$ in market $j$. For example, if HeatMid offers a \$1000 subsidy, we'd say that $s_{ij}=1000$.
+
+Let $q_{ij}(p)$ be the quantity of product $i$ which is purchased in market $j$ at price $p$. $q_{ij}$ is a function, whose parameters we need to estimate from some combination of data and heuristics. Keeping with a standard log-log form of the demand curve with constant price elasticity of demand, we assume that $q_{ij}(p) = X_{ij} p^{-\eta_{ij}}$.$\eta_{ij}$ is the price elasticity of demand for product $i$ in market $j$. 
+
+$X_{ij}$ is a scaling factor; we can calculate it with some algebra by knowing the the quantity of people who would purchase the product if the price was de minimis, say at \$100 (that is, the total addressable market). If $M$ is the total adressable market, then
+
+$$
+\begin{align*}
+M_{ij}&=X_{ij} 100^{-\eta_{ij}}\\
+\frac{M_{ij}}{100^{-\eta_{ij}}}&=X_{ij}\\
+100^{\eta_{ij}}M_{ij}&=X_{ij}
+\end{align*}
+$$
+
+(Note that usually these things are parameterized with more $\log$s thrown in, so that a price elasticity of demand of .001 by the above formulation might be listed as 6.9 in a table or coming out of a regression.)
+
+For example, if $X_{11} = 1,000,000$ middle-income households could buy a heat pump next year, and $\eta_{11} = .001$ is the price elasticity of demand for that market, then the number of heat pumps purchased by middle-income households as a function of price would be described as follows (note that we're putting price on the x axis and quantity on the y axis, which is not normal in economics but more sensible to me and probably to other outsiders):
 
 ```{r}
-q <- function(X, eta, p) {X * exp(-eta*p)}
+# Define our quantity as a function of price, M and eta
+q <- function(M, eta, p) {(100^eta*M) * p^(-eta)}
+```
+
+To visualize:
+```{r}
 ggplot() +
-  geom_function(fun = ~q(1000000, .001, .x), xlim = c(0,10000)) +
+  geom_function(fun = ~q(1000000, 1, .x), xlim = c(100,10000)) +
   xlab("Price") +
   ylab("Qty")
 ```
-That is, at a price of $5000 each, we expect people to buy `{r} q_example(5000)` heat pumps.
+
+That is, at a price of $5000 each, we expect `r q(1000000, .001, 5000)` households to buy heat pumps next year.
 
 Let $g_i$ be the greenhouse gas reduction from each unit of product $i$ which is purchased. Then we can draw a similar graph for GHG emission reduction in terms of price:
 
@@ -41,9 +66,12 @@ ggplot() +
   xlab("Price") +
   ylab("CO2 reduction")
 ```
-So at a price of $5000 per unit, we should expect `{r} q_example_2(5000)` kg of CO2 to be saved at a given price.
 
-However, to understand the impact of the subsidy $s_{ij}$, we need to compare the quantity which will be boought with the subsidy and the quantity which will be bought without the subsidy. We need a base price $p_i$ to work off of.
+So at a price of $5000 per unit, we should expect `r g_1 * q(1000000, .001, 5000)` kg of CO2 to be saved.
+
+However, to understand the impact of the subsidy $s_{ij}$, we need to compare the quantity which will be bought with the subsidy vs the quantity which will be bought without the subsidy. 
+
+To do this, we pick a base price $p_i$ to work off of. To continue this example of heat pumps for middle income households, let's say that our base price will be \$10,000, and our possible subsidy levels will run from 0 up to \$10,000. How much CO2 reduction can we expect at each subsidy level?
 
 ```{r}
 p_1 <- 10000
@@ -53,47 +81,40 @@ ggplot() +
   ylab("CO2 reduction")
 ```
 
-As a sanity check, let's calculate the marginal investment
+As we get close to complete subsidy, we save a ton of CO2, but it's also going to be extremely expensive to subsidize everyone's heat pump. What's the best use of our budget?
 
-$$
-m(s_{ij}) = g_{ij}\frac{q(p_i-s_{ij}) - q(p_i)}{s_{ij}q(p_i-s_{ij})}
-$$
+### Optimization
+
+Let's say our total budget $B$ is \$10,000,000. How should we select all of the incentive levels so that we get the biggest GHG reduction for our given budget?
+
+We start by expanding out the possible program subsidy levels and their resulting cost and GHG savings. Note again that all of these adressable market numbers and elasticities are made up, but we could estimate them from real data.
+
 ```{r}
+overhead = 1.2 # assume 20% overhead
+
 s11 <- tibble(subsidy = "HeatMid",
               g = g_1,
               X = 1000000,
               eta = .001,
               p = p_1,
               s = seq(100, p_1*.8, 1000), #max 80% subsidy
+              name = paste(subsidy, s, sep="-"),
               q_nosub = q(X, eta, p),
               q_sub = q(X, eta, p - s),
               g_saved = g*(q_sub - q_nosub),
-              s_total = s * q_sub,
-              g_eff = g_saved / s_total)
+              s_total = s * q_sub * overhead)
 
-s11 %>% ggplot(aes(x=s_total, y=g_eff, label=s)) + geom_line() + geom_label() +
-  xlab("Total subsidy") + ylab("CO2 saved per dollar") + 
-  ggtitle("Marginal reduction in CO2 for subsidies vs $10k reference price")
-```
-
-We can see, as expected, that as the subsidy increases the marginal impact of each dollar is less but the 
-
-## Optimization
-
-So now let's do the same thing for the other three subsidies:
-
-```{r}
 s12 <- tibble(subsidy = "HeatLow",
               g = g_1,
               X = 2000000, # larger market
               eta = .002, # more price sensitive
               p = p_1,
               s = seq(100, p_1*.8, 1000), #max 80% subsidy
+              name = paste(subsidy, s, sep="-"),
               q_nosub = q(X, eta, p),
               q_sub = q(X, eta, p - s),
               g_saved = g*(q_sub - q_nosub),
-              s_total = s * q_sub,
-              g_eff = g_saved / s_total)
+              s_total = s * q_sub * overhead)
 
 s21 <- tibble(subsidy = "SolarMid",
               g = 20000,
@@ -101,11 +122,11 @@ s21 <- tibble(subsidy = "SolarMid",
               eta = .0005, # less price sensitive
               p = 10000,
               s = seq(100, 10000*.8, 1000), #max 80% subsidy
+              name = paste(subsidy, s, sep="-"),
               q_nosub = q(X, eta, p),
               q_sub = q(X, eta, p - s),
               g_saved = g*(q_sub - q_nosub),
-              s_total = s * q_sub,
-              g_eff = g_saved / s_total)
+              s_total = s * q_sub * overhead)
 
 s22 <- tibble(subsidy = "SolarLow",
               g = 20000,
@@ -113,99 +134,103 @@ s22 <- tibble(subsidy = "SolarLow",
               eta = .001,
               p = 10000,
               s = seq(100, 10000*.8, 1000), #max 80% subsidy
+              name = paste(subsidy, s, sep="-"),
               q_nosub = q(X, eta, p),
               q_sub = q(X, eta, p - s),
               g_saved = g*(q_sub - q_nosub),
-              s_total = s * q_sub,
-              g_eff = g_saved / s_total)
+              s_total = s * q_sub * overhead)
+
+s <- rbind(s11, s12, s21, s22)
+B <- 1e7
 ```
 
-If our total budget $B$ is \$10,000,000, we can use these effective marginal ghg emissions to create a budget:
-
-TODO can we use this approach to optimize? or since we have discrete budget amounts, I think we need to use a 
-
+And taking a look,
 ```{r}
-B = 10000000
-rbind(s11, s12, s21, s22) %>%
-  arrange(-g_eff) %>%
-  mutate(tot_spend = cumsum(s_total)) %>%
-  filter(tot_spend <= B) %>%
-  group_by(subsidy) %>%
-  summarise(s = sum(s_total))
-```
-
-
-FIX BELOW
-Given the aforementioned subsidies from each program $s_{ij}$, and a base price $p_i$ for each product
-
-
-we should therefore expect the total GHG savings $T$ as a function subsidies to be 
-
-$$
-T = \sum_{i,j}(G_i X_{ij}(e^{-\eta_{ij}(p_i-s_{ij}})-e^{-\eta_{ij}(p_i))})
-$$
-Given a budget $B$, we should therefore allocate it by maximizing $T$ subject to $\sum_{ij} q_{ij}s_{ij} = B$.
-
-One way to do this is to assume that all of our subsidies are independent, then rescale our functions to be in terms of diminishing marginal GHG emissions per dollar as a function of each subsidy, and to greedily optimize from there. So, sticking with our original example:
-
-```{r}
-s11 <- tibble(s = seq(0,4000,1000),
-              p = 5000,
-              X = 1000000,
-              eta = .001,
-              q = q(X, eta, p - s),
-              g = g_1 * q,
-              t = q*s,
-              g_eff = g/t)
-              
-```
-
-To make this concrete again, suppose we have a budget of $B$ = \$10,000,000. Now, using some other plausible values for $P$ and $X$:
-
-```{r}
-X <- matrix(c(c(10e6, 5e6), c(4e6, 2e6)), 2, 2)
-eta <- c(.001, .0015)
-G <- c(10000, 20000)
-p <- c(5000, 10000)
-T <- function(s) {
-  ss = matrix(s, 2, 2)
-  out = 0
-  qty = c()
-  for (i in 1:2) {
-    for (j in 1:2) {
-      q <- X[i,j] * exp(-1 * eta[i] * (p[i] - ss[i,j]))
-      qty <- c(qty, q)
-      out <- out + G[i] * q
-    }
-  }
-  c(out, qty)
-}
-```
-
-```{r}
-
-```
-
-For example, with a subsidy matrix of 
-
-```{r}
-s = matrix(c(c(1000,2000),c(2000,3000)), 2, 2)
 s
 ```
 
-meaning a subsidy of \$1000 for heat pumps upstate and \$3000 for solar downstate, we see that we get T = `{r} T(c(s))[1]/1e6` million kg of CO2 saved per year.
+Now we can use an integer programming package (`lpSolve`) to select the right levels of each program for us, subject to the constraint of the budget.
 
-To handle our budget constraint $B$, we create a helper function:
+In this case, we have 32 possible combinations of (8 subsidy levels x 4 programs), so our linear solver will be a 32 dimensional Boolean vector $x\in{[0,1]}^{32}$.
+
+To ensure that we only have one choice per level, they will be subject to the constraint that all of the Booleans for a given program must sum to 1 (so that, for example, $x_1 + x_2 + x_3 + x_4 + x_5 + x_6 + x_7 + x_8 = 1$).
+
+We also want our budget to be within $B$, so we'll check that the linear combination $x\cdot s_{total} \leq B$, where $s_{total}$ is the total amount spent by the program at that subsidy level.
+
 ```{r}
-B = 10000
-proj <- function(ss) {-1 * T(B * ss/sum(ss))}
+num_programs <- s %>% count(subsidy) %>% nrow()
+
+# goal: maximize ghg saved
+f.obj <- pull(s, g_saved)
+
+# subject to the following constraints
+f.con <- matrix(c(s$s_total, # budget for each level
+          ifelse(pull(s, subsidy) == "HeatMid", 1, 0), # must pick one level per program
+          ifelse(pull(s, subsidy) == "HeatLow", 1, 0), # tk make this more automated
+          ifelse(pull(s, subsidy) == "SolarMid", 1, 0),
+          ifelse(pull(s, subsidy) == "SolarLow", 1, 0)),
+          nrow=5, byrow = TRUE)
+
+f.dir <- c("<=", replicate(num_programs, "="))
+f.rhs <- c(B, replicate(num_programs, 1))
 ```
 
-Therefore to maximize our impact, we should select:
+We run the optimization, using integer programming magic.
+
 ```{r}
-optim_1 <- nloptr(x0 = c(.2,.2,.2,.2), 
-                  eval_f = proj,
-                  lb = c(0,0,0,0),
-                  ub = c(1,1,1,1),
-                  opts = list("algorithm" = "NLOPT_LN_SBPLX"))
+optim.1 <- lp(direction = "max",
+              f.obj,
+              f.con,
+              f.dir,
+              f.rhs,
+              all.bin = TRUE)
+```
+
+How close did we get to the budget, given these program options?
+
+```{r}
+sum(s$s_total[optim.1$solution == 1])/B
+```
+
+Which programs to fund, and at what subsidy level?
+
+```{r}
+s$name[optim.1$solution == 1]
+```
+
+How much millions of kg of GHG will we save per year?
+
+```{r}
+sum(s$g_saved[optim.1$solution == 1]) / 1e6
+```
+
+```{r}
+f.dir.2 <- c("<=", replicate(num_programs, "<="))
+
+optim.2 <- lp(direction = "max",
+              f.obj,
+              f.con,
+              f.dir.2,
+              f.rhs,
+              all.bin = TRUE)
+```
+
+Now how close did we get to the budget, given these program options?
+
+```{r}
+sum(s$s_total[optim.2$solution == 1])/B
+```
+
+
+
+And which programs to fund?
+
+```{r}
+s$name[optim.2$solution == 1]
+```
+
+Now how much millions of kg of GHG will we save per year?
+
+```{r}
+sum(s$g_saved[optim.2$solution == 1]) / 1e6
 ```
