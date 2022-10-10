@@ -3,9 +3,9 @@ title: "New York Climate Budget Optimization Proof of Concept"
 author: "Max Shron"
 date: "10/7/2022"
 output:
-  html_document: default
-  pdf_document: default
   word_document: default
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -26,121 +26,128 @@ Our objective is to maximize the green-house gas (GHG) savings caused by the mon
 
 We have two products, so let's index each product with an integer (e.g. Heat Pump = 1, Solar Arrays = 2). We do similarly for each market (middle income households vs low income households). Then the subsidy $s_{ij}$ is the subsidy offered by a given program to subsidize good $i$ in market $j$. For example, if HeatMid offers a \$1000 subsidy, we'd say that $s_{ij}=1000$.
 
-Let $q_{ij}(p)$ be the quantity of product $i$ which is purchased in market $j$ at price $p$. $q_{ij}$ is a function, whose parameters we need to estimate from some combination of data and heuristics. Keeping with a standard log-log form of the demand curve with constant price elasticity of demand, we assume that $q_{ij}(p) = X_{ij} p^{-\eta_{ij}}$.$\eta_{ij}$ is the price elasticity of demand for product $i$ in market $j$. 
+Let $q_{ij}(p)$ be the quantity of product $i$ which is purchased in market $j$ at price $p$. $q_{ij}$ is a function, whose parameters we need to estimate from some combination of data and heuristics. Keeping with a standard log-log form of the demand curve with constant price elasticity of demand, we assume that $q_{ij}(p) = X_{ij} p^{-\eta_{ij}}$. $\eta_{ij}$ is the price elasticity of demand for product $i$ in market $j$, and $X_ij$ is a scaling factor. In practice we would estimate these in log form, since $\log(q_{ij}(p) = \log(X_{ij} p^{-\eta_{ij}})=\log(X_{ij})-\eta_{ij}\log(p)$ which is conveniently linear.
 
-$X_{ij}$ is a scaling factor; we can calculate it with some algebra by knowing the the quantity of people who would purchase the product if the price was de minimis, say at \$100 (that is, the total addressable market). If $M$ is the total adressable market, then
+In practice, we ought to be able to estimate the price elasticity of demand and the shift parameter empirically, using the subsides themselves as instrumental variables. The subsidies have changed periodically and without much warning, affecting the sales of the products and forming a kind of natural experiment on effective prices. For other markets, there are industry sources which publish estimates for the price elasticity of demand which we could access ourselves for money. And if we needed to, we could estimate the demand curve from Monte Carlo simulations of household behavior, which we have already taken a crack at in the case of heat pumps. Either way, once we have a demand curve we can get rolling.
 
-$$
-\begin{align*}
-M_{ij}&=X_{ij} 100^{-\eta_{ij}}\\
-\frac{M_{ij}}{100^{\eta_{ij}}}&=X_ij
-\end{align*}
-$$
+For example, if 10,000 middle-income households bought \$10,000 heat pumps in one year under a \$2000 HeatMid subsidy, and 15,000 middle-income households bought \$10,000 heat pumps under a \$3000 subsidy, then:
 
-(Note that usually these things are parameterized with more $\log$s thrown in, so that a price elasticity of demand of .001 by the above formulation might be listed as 6.9 in a table or coming out of a regression.)
+```{r}
+heatmid <- tibble(year = c(1,2), 
+                  sticker_price = 10000, 
+                  subsidy = c(2000, 3000),
+                  price = sticker_price - subsidy,
+                  qty = c(10000, 15000))
 
-For example, if $X_{11} = 1,000,000$ middle-income households could buy a heat pump next year, and $\eta_{11} = .001$ is the price elasticity of demand for that market, then the number of heat pumps purchased by middle-income households as a function of price would be described as follows (note that we're putting price on the x axis and quantity on the y axis, which is not normal in economics but more sensible to me and probably to other outsiders):
+m.1 <- lm(log(qty) ~ log(price), data = heatmid)
+m.1
+```
+Pulling out the coefficients,
+
+```{r}
+X_11 = exp(m.1$coefficients[1])
+eta_11 = -m.1$coefficients[2]
+```
+
+We can then plot this (note that we're putting price on the x axis and quantity on the y axis, which is not normal in economics but more sensible to me and probably to other outsiders):
 
 ```{r}
 # Define our quantity as a function of price, X and eta
-q <- function(X, eta, p) {X * exp(-eta * p)}
-```
+qty <- function(X, eta, p) {X * p^(-eta)}
 
-To visualize:
-```{r}
 ggplot() +
-  geom_function(fun = ~q(1000000, .001, .x), xlim = c(10,10000)) +
+  geom_function(fun = ~qty(X_11, eta_11, .x), xlim = c(3000,20000)) +
   xlab("Price") +
   ylab("Qty")
 ```
 
-That is, at a price of $5000 each, we expect `r q(1000000, .001, 5000)` households to buy heat pumps next year.
+That is, at a price of $6,000 each, we expect `r qty(X_11, eta_11, 6000)` households to buy heat pumps next year.
 
 Let $g_i$ be the greenhouse gas reduction from each unit of product $i$ which is purchased. Then we can draw a similar graph for GHG emission reduction in terms of price:
 
 ```{r}
 g_1 = 10000 # kg of CO2 reduced per year per unit
 ggplot() +
-  geom_function(fun = ~ g_1 * q(1000000, .001, .x), xlim = c(0,10000)) +
+  geom_function(fun = ~ g_1 * qty(X_11, eta_11, .x), xlim = c(3000,20000)) +
   xlab("Price") +
   ylab("CO2 reduction")
 ```
 
-So at a price of $5000 per unit, we should expect `r g_1 * q(1000000, .001, 5000)` kg of CO2 to be saved.
+So at a price of $6,000 per unit, we should expect `r g_1 * qty(X_11, eta_11, 6000)` kg of CO2 to be saved.
 
 However, to understand the impact of the subsidy $s_{ij}$, we need to compare the quantity which will be bought with the subsidy vs the quantity which will be bought without the subsidy. 
 
-To do this, we pick a base price $p_i$ to work off of. To continue this example of heat pumps for middle income households, let's say that our base price will be \$10,000, and our possible subsidy levels will run from 0 up to \$10,000. How much CO2 reduction can we expect at each subsidy level?
+To do this, we pick a base price $p_i$ to work off of. To continue this example of heat pumps for middle income households, let's say that our base price will be \$10,000, and our possible subsidy levels will run from 0 up to \$8,000. How much CO2 reduction can we expect at each subsidy level?
 
 ```{r}
 p_1 <- 10000
 ggplot() +
-  geom_function(fun = ~ g_1 * (q(1000000, .001, p_1 - .x) - q(1000000, .001, p_1)), xlim = c(0,p_1)) +
+  geom_function(fun = ~ g_1 * (qty(X_11, eta_11, p_1 - .x) - qty(X_11, eta_11, p_1)), xlim = c(0,p_1*.8)) +
   xlab("Subsidy") +
   ylab("CO2 reduction")
 ```
 
-As we get close to complete subsidy, we save a ton of CO2, but it's also going to be extremely expensive to subsidize everyone's heat pump. What's the best use of our budget?
+As we get to an 80% subsidy, we save a ton of CO2, but it's also going to be extremely expensive to subsidize everyone's heat pump. What's the best use of our budget?
 
 ### Optimization
 
-Let's say our total budget $B$ is \$10,000,000. How should we select all of the incentive levels so that we get the biggest GHG reduction for our given budget?
+Let's say our total budget $B$ is \$1,000,000,000. How should we select all of the incentive levels so that we get the biggest GHG reduction for our given budget?
 
-We start by expanding out the possible program subsidy levels and their resulting cost and GHG savings. Note again that all of these adressable market numbers and elasticities are made up, but we could estimate them from real data.
+We start by expanding out the possible program subsidy levels and their resulting cost and GHG savings. Note again that all of these parameters are made up, but we could estimate them from real data.
 
 ```{r}
 overhead = 1.2 # assume 20% overhead
 
 s11 <- tibble(subsidy = "HeatMid",
               g = g_1,
-              X = 1000000,
-              eta = .001,
+              X = X_11,
+              eta = eta_11,
               p = p_1,
               s = seq(100, p_1*.8, 1000), #max 80% subsidy
               name = paste(subsidy, s, sep="-"),
-              q_nosub = q(X, eta, p),
-              q_sub = q(X, eta, p - s),
+              q_nosub = qty(X, eta, p),
+              q_sub = qty(X, eta, p - s),
               g_saved = g*(q_sub - q_nosub),
               s_total = s * q_sub * overhead)
 
 s12 <- tibble(subsidy = "HeatLow",
               g = g_1,
-              X = 2000000, # larger market
-              eta = .002, # more price sensitive
+              X = X_11*1.5, # larger market
+              eta = eta_11*1.03, # more price sensitive
               p = p_1,
               s = seq(100, p_1*.8, 1000), #max 80% subsidy
               name = paste(subsidy, s, sep="-"),
-              q_nosub = q(X, eta, p),
-              q_sub = q(X, eta, p - s),
+              q_nosub = qty(X, eta, p),
+              q_sub = qty(X, eta, p - s),
               g_saved = g*(q_sub - q_nosub),
               s_total = s * q_sub * overhead)
 
 s21 <- tibble(subsidy = "SolarMid",
               g = 20000,
-              X = 100000, # much smaller market
-              eta = .0005, # less price sensitive
+              X = X_11*0.5, # much smaller market
+              eta = eta_11*0.93, # less price sensitive
               p = 10000,
               s = seq(100, 10000*.8, 1000), #max 80% subsidy
               name = paste(subsidy, s, sep="-"),
-              q_nosub = q(X, eta, p),
-              q_sub = q(X, eta, p - s),
+              q_nosub = qty(X, eta, p),
+              q_sub = qty(X, eta, p - s),
               g_saved = g*(q_sub - q_nosub),
               s_total = s * q_sub * overhead)
 
 s22 <- tibble(subsidy = "SolarLow",
               g = 20000,
-              X = 200000, # much smaller market
-              eta = .001,
+              X = X_11*0.7, # much smaller market
+              eta = eta_11*0.97,
               p = 10000,
               s = seq(100, 10000*.8, 1000), #max 80% subsidy
               name = paste(subsidy, s, sep="-"),
-              q_nosub = q(X, eta, p),
-              q_sub = q(X, eta, p - s),
+              q_nosub = qty(X, eta, p),
+              q_sub = qty(X, eta, p - s),
               g_saved = g*(q_sub - q_nosub),
               s_total = s * q_sub * overhead)
 
 s <- rbind(s11, s12, s21, s22)
-B <- 1e7
+B <- 1e9
 ```
 
 And taking a look,
@@ -201,35 +208,4 @@ How much millions of kg of GHG will we save per year?
 
 ```{r}
 sum(s$g_saved[optim.1$solution == 1]) / 1e6
-```
-
-```{r}
-f.dir.2 <- c("<=", replicate(num_programs, "<="))
-
-optim.2 <- lp(direction = "max",
-              f.obj,
-              f.con,
-              f.dir.2,
-              f.rhs,
-              all.bin = TRUE)
-```
-
-Now how close did we get to the budget, given these program options?
-
-```{r}
-sum(s$s_total[optim.2$solution == 1])/B
-```
-
-
-
-And which programs to fund?
-
-```{r}
-s$name[optim.2$solution == 1]
-```
-
-Now how much millions of kg of GHG will we save per year?
-
-```{r}
-sum(s$g_saved[optim.2$solution == 1]) / 1e6
 ```
