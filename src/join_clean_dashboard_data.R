@@ -26,7 +26,8 @@ programs_by_quarter <- programs %>%
   ) %>%
   summarize(
     expenditures=sum(total_program_dollars_expenditures_this_quarter),
-    reductions=sum(direct_annual_co2e_emission_reductions_metric_tons_acquired_this_quarter)
+    reductions=sum(direct_annual_co2e_emission_reductions_metric_tons_acquired_this_quarter),
+    reductions=sum(direct_gross_lifetime_co2e_emission_reductions_metric_tons_acquired_this_quarter)
   )
 
 participants_by_quarter <- participants %>% 
@@ -46,7 +47,7 @@ participants_by_quarter <- participants %>%
   summarize(participants=sum(participants_acquired_this_quarter)) 
 
 programs_by_quarter %>% 
-  left_join(participants_by_quater, 
+  left_join(participants_by_quarter, 
             by=c(
               "program_administrator",
               "fuel_type_funding_source",
