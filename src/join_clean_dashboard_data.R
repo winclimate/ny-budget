@@ -1,4 +1,3 @@
-install.packages("janitor")
 library(tidyverse)
 library(readxl)
 library(janitor)
@@ -27,7 +26,7 @@ programs_by_quarter <- programs %>%
   ) %>%
   summarize(
     expenditures=sum(total_program_dollars_expenditures_this_quarter),
-    reductions=sum(direct_gross_lifetime_co2e_emission_reductions_metric_tons_acquired_this_quarter)
+    reductions=sum(direct_annual_co2e_emission_reductions_metric_tons_acquired_this_quarter)
   )
 
 participants_by_quarter <- participants %>% 
