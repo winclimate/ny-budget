@@ -11,7 +11,7 @@ out_path <- paste(base,"programs_participants_joined.csv", sep="")
 programs <- read_excel(prog_path) %>% clean_names
 participants <- read_excel(part_path) %>% clean_names
 
-programs_by_year <- programs %>%
+programs_by_quarter <- programs %>%
   group_by(
     program_administrator,
     fuel_type_funding_source,
@@ -30,7 +30,7 @@ programs_by_year <- programs %>%
     reductions=sum(direct_gross_lifetime_co2e_emission_reductions_metric_tons_acquired_this_quarter)
   )
 
-participants_by_year <- participants %>% 
+participants_by_quarter <- participants %>% 
   group_by(
     program_administrator,
     fuel_type_funding_source,
@@ -46,8 +46,8 @@ participants_by_year <- participants %>%
   ) %>%
   summarize(participants=sum(participants_acquired_this_quarter)) 
 
-programs_by_year %>% 
-  left_join(participants_by_year, 
+programs_by_quarter %>% 
+  left_join(participants_by_quater, 
             by=c(
               "program_administrator",
               "fuel_type_funding_source",
