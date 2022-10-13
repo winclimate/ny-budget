@@ -6,6 +6,8 @@ library(janitor)
 base <- "data/nyserda_clean_energy_dashboard_q2_2022/"
 prog_path <- paste(base,"CED Open NY Program - Q2 2022.xlsx", sep="")
 part_path <- paste(base,"CED Open NY Participants - Q2 2022.xlsx", sep="")
+out_path <- paste(base,"programs_participants_joined.csv", sep="")
+
 programs <- read_excel(prog_path) %>% clean_names
 participants <- read_excel(part_path) %>% clean_names
 
@@ -44,7 +46,7 @@ participants_by_year <- participants %>%
   ) %>%
   summarize(participants=sum(participants_acquired_this_quarter)) 
 
-programs_participants_joined <- programs_by_year %>% 
+programs_by_year %>% 
   left_join(participants_by_year, 
             by=c(
               "program_administrator",
@@ -58,5 +60,5 @@ programs_participants_joined <- programs_by_year %>%
               "active_inactive",
               "year",
               "reporting_period"
-            ))
-
+            )) %>%
+  write_csv(out_path)
