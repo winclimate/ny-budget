@@ -2,7 +2,10 @@
 title: "New York Climate Budget"
 author: "Max Shron"
 date: "10/10/2022"
-output: html_document
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
 ---
 
 ```{r setup, include=FALSE}
@@ -11,27 +14,108 @@ library(tidyverse)
 library(lpSolve)
 library(lubridate)
 library(units)
+library(janitor)
+install_unit("dollars")
+install_unit("ashp")
+install_unit("mcf")
+library(sf)
 ```
 
 ## Blank slate program design
 
-To start with, we will estimate the amount of subsides we ought to be directing per major clean energy good, independent of the programs which we have, subject to various budget constraints. We will use real empirical data to estimate the demand curves for each of these goods, following the approach laid out in [Climate Budget Optimization Proof of Concept](https://docs.google.com/document/d/1eq0kjtzUI4ryUuUtnjAypdzBlsGi93Nf/edit#).
-
-We will look at subsidies for:
+For this analysis, we're going to estimate the amount of money which we should subsidize for each program, starting from the premise that there are only four programs and we can set the subsidy for them at any level. Those four programs are for: 
 
 * Rooftop solar
 * Heat pumps
 * Weatherization
 * Electric vehicles
-* Charging stations
+
+We will estimate the amount of subsides we ought to be directing per major household clean energy good, independent of the programs which we have, subject to various budget constraints. We will use real empirical data to estimate the demand curves for each of these goods, following the approach laid out in [Climate Budget Optimization Proof of Concept](https://docs.google.com/document/d/1eq0kjtzUI4ryUuUtnjAypdzBlsGi93Nf/edit#).
+
+We will compare using 10-year CO2e reductions to keep everything apples to apples, and to take into account the shift in prices baked into the CLCPA through upfront rebates and tax credits. We use 10-year numbers since one year doesn't bake in the longer-term impacts, but 10-years is short enough to credibly look at trade-offs between EVs and more intensive capital investments like rooftop solar. The numbers would probably shift slightly if we went all the way out to 20-30 years, but likely not shift substantially.
+
+Note also that we're lumping all of the different subsidy types (rebates, tax credits, discount loans) into one number. In practice, each of these goods is covered by a bunch of different programs offering slightly different products, but in the interest of time we're lumping them together. In devising a real budget, care should be taken to roughly align the spending priorities against the output of this analysis without taking the specifics too literally.
+
+## Computing some background numbers
+
+### Imputing household subsidy groups from ACS data
+
+We need to estimate how many households fall into each of the IRA subsidy levels in order to accurately size the discounts. For simplicity, we're going to assume that, with the higher discounts for low income households, uptake is uniform across the population, though in practice the actual average discount will probably be lower since low-income households will be less likely to invest, even with the subsides (and cheaper loans).
+
+This is done per-county, so we have to roll it back up to the state level. Technically it's decided by household size as well, but to first approximation we just use the median household income numbers per county as a proxy. We count number of households below 80% of the median income, between 80% and 150% of the median income, and above 150%, and label those low, medium, and high income households respectively.
+
+Our data are per-county, per income bucket counts from the ACS.
+
+```{r}
+acs <- read_csv('/mnt/data/ACSST5Y2020.S1901-2022-10-18T145342.csv') %>%
+  select(contains("!!Households!!Estimate")) %>%
+  clean_names() %>%
+  rename_with(~ gsub('_.*','', .x)) %>%
+  slice_head(n = 12)
+
+county_median_income <- acs %>% slice_tail(n = 1) %>%
+  pivot_longer(everything(), names_to = "county", values_to = "median_income") %>%
+  mutate(median_income = as.numeric(gsub(",","",median_income)))
+
+county_hh <- acs %>% slice_head(n = 1) %>%
+  pivot_longer(everything(), names_to = "county", values_to = "population") %>%
+  mutate(population = as.numeric(gsub(",","",population))) %>%
+  left_join(county_median_income, by = 'county')
+
+midpoint <- tibble(midpoint = c(10000,12500,20000,30000,42500,62500,87500,125000,175000,300000))
+
+ny_ira_income_buckets <- cbind(midpoint, acs %>% slice_tail(n = -1) %>% slice_head(n = -1)) %>%
+  pivot_longer(-midpoint, names_to = 'county', values_to = 'percent') %>%
+  mutate(percent = as.numeric(gsub('%','',percent))/100) %>%
+  left_join(county_hh, by='county') %>%
+  mutate(income_level = case_when(
+                          midpoint < (.8 * median_income) ~ "low",
+                          midpoint < (1.5 * median_income) ~ "medium",
+                          TRUE ~ "high"),
+         households = population * percent) %>%
+  group_by(income_level) %>%
+  summarise(n = sum(households)) %>%
+  ungroup() %>%
+  mutate(pct = n / sum(n))
+    
+ny_ira_income_buckets
+```
+
+### Estimating CO2e per kWh
+
+Heat pumps and EVs, they consume energy, so it matters what the GHG load is of the energy they are consuming.
+
+We calculate the average CO2e per kWh over the next ten years, by taking the current numbers and ramping them down to 0 on the way to 2040, as per the CLCPA guidelines. That is, while the current energy mix is about 50% natural gas and 50% clean energy (and therefore has a CO2e load of about half of what it would be if it were all natural gas), that energy mix is slated to reduce to all clean energy over the next 20 years.
+
+```{r}
+# https://www.eia.gov/state/?sid=NY#tabs-4
+# keeping it simple -- energy mix is 50% natural gas, and the rest is low-emissions
+# https://www.epa.gov/sites/default/files/2020-12/documents/power_plants_2017_industrial_profile_updated_2020.pdf says that each MWh is 407kg of CO2e
+natural_gas_co2_kwh = as_units(407/1e3, "kg/(kW*h)")
+ny_co2_kwh = .5 * natural_gas_co2_kwh
+ 
+# This will ramp down to 0 by 2040, as per the CLCPA, but we only go out 10 years
+clcpa_ramp <- seq(from=1, to=0, length.out=2040-2022)[1:10]
+
+# Therefore, ignoring out-of-state energy generation, this is 10-year GHG reduction per kWh of electricity per year
+g_kwh <- (clcpa_ramp * ny_co2_kwh) %>% sum()
+```
+
+## Goods
 
 ### Rooftop Solar Subsidies
 
 To start, since we have data on each small-scale solar installation in New York, let's see if we can learn a demand curve and see how good it is.
 
+Note that, though there is a 25% New York State tax credit for rooftop solar, it's been in place at least since the early 2000s, so we can factor it out of this analysis. That is, what we actually care about is how drops in price from subsides will increase demand, so constant impacts on the price are irrelevant for our analysis. It's true that the per-installation cap has moved around between \$3500 and \$5000, which means it has some inmpact, but it's hard to pull the data together and seems like a marginal effect, so I'm going to ignore it.
+
+For this data, we will analyze at the installed kW level. That is, while the other analysis involve e.g. whole EVs or heat pumps, here we've got enough data to analyze in a way that respects the different sized installations. It would have been good to do the same for heat pumps, since the install costs and subsidies scale with the listed BTU capacity, but we don't have the data for them. So it goes.
+
 ```{r}
 # https://data.ny.gov/Energy-Environment/Solar-Electric-Programs-Reported-by-NYSERDA-Beginn/3x8r-34rs
 raw_solar_data <- read_csv("/mnt/data/Solar_Electric_Programs_Reported_by_NYSERDA__Beginning_2000.csv")
+
+# I pulled together the changing Federal tax levels
 fed_solar_tax_credit = tibble(tax_year = 2000:2022, fed_credit = c(replicate(2005-1999, .1), 
                                                                replicate(2020-2005, .3), 
                                                                c(.26, .26)))
@@ -47,7 +131,7 @@ solar_data <- raw_solar_data %>%
   summarise(n = n(),
             total_kw = sum(`Total Nameplate kW DC`),
             total_sticker_price = sum(`Project Cost`),
-            total_incentive = sum(`$Incentive`, na.rm = TRUE),  # TODO figure out gjgny / other subsidy program impacts too
+            total_incentive = sum(`$Incentive`, na.rm = TRUE),  # TODO possibly figure out gjgny / other subsidy programs impact too
             fed_credit = mean(fed_credit)) %>%
   mutate(adj_tax_year = tax_year - 2000,
             incentive_per_kw = total_incentive / total_kw,
@@ -64,7 +148,8 @@ Rolled up at the year, let's see what we've got
 solar_data %>%
   ggplot(aes(x=tax_year, y=incentive_per_kw)) + geom_line()
 ```
-To be honest, not a great instrumental variable, given how closely related it is to year. However, prices per kW themselves have changed drastically, and I believe largely as a result of exogenous technology improvements (as opposed to drops in demand). As a result, I'm comfortable that we can fit a straightforward regression to log(qty) against log(price) and year, instead of a more complex simultaneous estimation of supply and demand curves.
+
+To be honest, not a _great_ instrumental variable, given how closely related it is to year. However, prices per kW themselves have changed drastically, and I believe largely as a result of exogenous technology improvements (as opposed to drops in demand). As a result, I'm comfortable that we can fit a straightforward regression to log(qty) against log(price) and year, instead of a more complex simultaneous estimation of supply and demand curves.
 
 ```{r}
 solar_data %>% 
@@ -86,7 +171,7 @@ solar.model.2 <- lm(total_kw ~ effective_price_per_kw, data = solar_data)
 summary(solar.model.2)
 ```
 
-Linear is not great; coefficients point in the right direction, but big drop in $R^2$. 
+Linear is worse; coefficients point in the right direction, but big drop in $R^2$. 
 
 Finally, let's try the function mentioned earlier, one which includes a demand curve shift based on the log years since the program started in 2000.
 
@@ -94,114 +179,248 @@ Finally, let's try the function mentioned earlier, one which includes a demand c
 solar.model.3 <- lm(log(total_kw) ~ log(effective_price_per_kw) + log(adj_tax_year+1), data = solar_data)
 summary(solar.model.3)
 ```
-Spectacular! Good looking coefficients and $R^2$ of 0.99. Now to graph all three.
 
-```{r}
-qty <- function(X, eta, p) {X * p^(-eta)}
-
-X_solar_kw_loglog = exp(solar.model.1$coefficients[1])
-eta_solar_kw_loglog = -solar.model.1$coefficients[2]
-
-b = solar.model.2$coefficients[1]
-m = solar.model.2$coefficients[2]
-
-model.3.preds <- tibble(price = seq(600,5000, length.out=100),
-                        logqty = predict(solar.model.3, list(adj_tax_year=replicate(100,23), effective_price_per_kw=price)),
-                        qty = exp(logqty))
-
-qty_solar <- function(p) {predict(solar.model.3, list(adj_tax_year=replicate(length(p), 23), effective_price_per_kw=p)) %>% exp}
-                                                          
-historical_min_price = min(solar_data$effective_price_per_kw)
-most_recent = last(solar_data$effective_price_per_kw)
-
-solar_data %>% 
-  ggplot(aes(x=effective_price_per_kw, y=total_kw, label = tax_year)) +
-  #geom_function(fun = ~qty(X_solar_kw, eta_solar_kw, .x), 
-  #              xlim=c(historical_min_price*(0.8), historical_min_price*(2)), color='red') +
-  geom_function(fun = ~ m *.x + b, 
-                xlim=c(historical_min_price*(0.8), historical_min_price*(3)), color='blue') +
-  geom_function(fun = ~ (qty_solar(.x)),
-                xlim=c(historical_min_price*(0.8), historical_min_price*(3)), color='green') +
-  geom_point() + geom_label() +
-  xlim(c(historical_min_price*(0.8), historical_min_price*3)) + 
-  xlab("Price / kW") +
-  ylab("Qty kW")
-```
-
-Red is the original demand function I sought to fit (log-log), blue is a linear function, and green is a log-log function with a log(year) based demand shift parameter. The third (green) model is great; as mentioned before, it's got a 0.98 $R^2$, the parameters all point in the right direction, the standard errors are all far from zero, and fits our general functional goals. '
-
-I'm going to declare that one the winner. The only reason it doesn't look like it's bang on in the graph is because I'm drawing the predictions for `year=2023`, not the years that the data were actually collected.
+Spectacular! Good looking coefficients and $R^2$ of 0.99.
 
 Next we need to calculate how many kg of CO2e are saved per kW installed per year.
 
 ```{r}
-# Total electricity generation NYS is 28.7 billion kWh (https://www.nypa.gov/power/generation/generation-overview)
-ny_energy_total <- as_units(28.7e9, 'kW*h')
-
-# Total mmtCO2e GWP20 for energy generation in-state (https://www.dec.ny.gov/docs/administration_pdf/ghgsumrpt21.pdf)
-ny_energy_ghg <- as_units(50.64e9, 'kg')
+# We assume one kWh of solar energy displaces one kWh of natural gas, for the whole 10 years
 
 # Hours of sunlight per year (https://www.solardirect.com/archives/pv/systems/gts/gts-sizing-sun-hours.html)
 # averaged over the five example cities
-ny_sunlight_annual_hrs <- as_units(3.5*365, 'hr/year')
+ny_sunlight_annual_hrs <- as_units(3.5*365, "hr")
 
-g_solar_kwh <- ny_energy_ghg / ny_energy_total # ignoring out-of-state energy and GHG effects of the panels themselves
+g_solar <- natural_gas_co2_kwh * 10 * ny_sunlight_annual_hrs # since our units are per 1-kW installed capacity level, this is simple, over 10 years
 
-g_solar <- g_solar_kwh * ny_sunlight_annual_hrs
 g_solar
 ```
 
-Finally for this one, let's look at different possible subsidy levels:
+Finally, let's look at different possible subsidy levels:
 
 ```{r}
-p_solar_base <- 1000
+p_solar_base <- as_units(1000, "dollars / kW") # picking the current per kW price as a starting point
 
 qty_solar <- function(p) {
     solar.model.3 %>%
     predict(list(adj_tax_year=replicate(length(p), 23), effective_price_per_kw=p)) %>% 
     exp %>%
-    as_units("kW*h")
+    as_units("kW")
 }
 
-s_solar <- tibble(subsidy_kwh = seq(0, p_solar_base * 0.8, length.out = 50),
+# We explore up to a 75% subsidy
+s_solar <- tibble(subsidy_kw = seq(as_units(0, "dollars/kW"), p_solar_base * 0.75, length.out = 11),
                   qty_no_subsidy = qty_solar(p_solar_base),
-                  qty_w_subsidy = qty_solar(p_solar_base - subsidy_kwh),
+                  qty_w_subsidy = qty_solar(p_solar_base - subsidy_kw),
                   incremental_qty = qty_w_subsidy - qty_no_subsidy,
-                  ghg_saved = g_solar * incremental_qty)
+                  subsidy_expense = qty_w_subsidy * subsidy_kw * 1.2,
+                  good = "Solar",
+                  ghg_saved = g_solar * incremental_qty,
+                  ghg_saved_per_dollar = ghg_saved / subsidy_expense) %>%
+                  unite(program, c(good, subsidy_kw), remove = FALSE)
 
 s_solar %>%
-  ggplot(aes(x = subsidy_kwh, y = ghg_saved)) +
-  geom_line() +
-  xlim(c(0, p_solar_base*.8)) +
-  xlab("Subsidy ($/kW)") +
-  ylab("CO2 reduction")
+  ggplot(aes(x = subsidy_kw, y = ghg_saved)) +
+  geom_line()
+```
+
+
+```{r}
+s_solar
 ```
 
 ### Heat Pump Subsidies
 
-We can get per-year data, average heat pump prices. Redo everything into BTUs to account for wide variety of homes. Have prices been changing year on year for heat pumps?
+Unfortunately, Clean Heat has only been going for a few years, and because their per-quarter numbers seem sloppy (it seems like they're taking credit for installs 1-2 quarteres before they pay out rebates, but the time lag is not consistent over time) we're going with whole year data.
+
+However, let's start with the quarterly data so we can see how the program has grown.
+
+```{r, fig.width = 9, fig.height=4}
+nyserda_dashboard <- read_csv("/mnt/data/nyserda_clean_energy_dashboard_q2_2022/programs_participants_joined.csv")
+
+clean_heat <- nyserda_dashboard %>% 
+  filter(nys_clean_heat == "Yes", year >= 2020, reporting_period <= "2022 Q2")
+  
+clean_heat %>% 
+  group_by(reporting_period, primary_end_use_sector) %>%
+  summarise(total_spent = sum(expenditures, na.rm = TRUE),
+            participants = sum(participants, na.rm = TRUE),
+            avg_subsidy = total_spent/participants) %>%
+  filter(participants > 10) %>%
+  ggplot(aes(x=reporting_period, y=total_spent, fill=primary_end_use_sector)) +
+  geom_col(position = 'stack') +
+  scale_y_continuous(labels=scales::dollar_format())
+```
+To first approximation, we're okay to just focus on the residential sector as a proxy.
+
+```{r}
+clean_heat %>% 
+  group_by(reporting_period, primary_end_use_sector) %>%
+  summarise(total_spent = sum(expenditures, na.rm = TRUE),
+            participants = sum(participants, na.rm = TRUE),
+            avg_subsidy = total_spent/participants) %>%
+  filter(participants > 10) %>%
+  ungroup() %>%
+  ggplot(aes(x=reporting_period, y=avg_subsidy, color=primary_end_use_sector, group=primary_end_use_sector)) +
+  geom_line() +
+  scale_y_continuous(labels=scales::dollar_format())
+
+```
+Average subsidies per household have gone up over time for residential, so we can use that as an instrumental variable.
+
+We calculate the savings by comparing against the CO2e of heating the a house with natural gas. We're using a "typical" poorly insulated house here, since we're not modeling weatherization at the same time. In practice, the savings ought to be even more substantial, since people are likely to combine heat pumps with weatherization.
+
+```{r}
+# https://www.epa.gov/energy/greenhouse-gases-equivalencies-calculator-calculations-and-references
+# note: does not include leaks, just CO2 generated directly
+# btus from https://docs.google.com/spreadsheets/d/1_qa2cPoFsQw2D_yxjgVgduXO-OJym6pFeodv5gtxG3s/edit#gid=2145034962, modified zone 5 for less well insulated buildings
+yearly_heat_loss <- as_units(172e6, "btu")
+ng_system_efficiency <- .8 # replacing older systems
+yearly_btus <- yearly_heat_loss/ng_system_efficiency
+kg_per_mbtu <- as_units(52, "kg/(1000000btu)")
+furnace_yearly_kg <- yearly_btus * kg_per_mbtu
+
+ashp_load <- yearly_heat_loss/(as_units(10,"btu/(W*h)")) # take BTUs/year, divide by HSPF of 10 to get Wh
+
+g_ashp <- (10*furnace_yearly_kg) - (ashp_load * g_kwh) # default - alternative
+```
+
+Now we roll up the year level. I'm also including a "fudge factor" for the first year of the program, since it was just ramping up, and the price differences alone are definitely not sufficicent to justify the gap. If we just used the actual numbers, it looks like even a tiny price change is a _huge_ motivator, way beyond all reasonable numbers, so I'm basically tripling the household estimates for the first year.
+
+A more robust way to do this would be to fit this model with a strong prior on the price elasticity of demand coefficient. Lacking that, I'm doing something similar here by scaling up the participant numbers to something more like what it would be if had been fully up and running.
+
+```{r}
+# from Draft Climate tech annex 1, Bldg_Res Device Cost; usable average for a retrofit
+p_ashp_avg <- 2*14678 # assume two systems
+
+clean_heat_ashp <- clean_heat %>%
+  filter(year < 2022, program_name == "Clean Heat - Residential Air Source Heat Pump") %>%
+  drop_na() %>%
+  group_by(year) %>%
+  summarise(total_participants = sum(participants) * 1.3, # NYSEG, PSEG, RG&E don't break out by type, so just scale up; we know that GSHP are 2x as effective but they're a rounding error
+            total_subsidy = sum(expenditures)) %>%
+  mutate(first_year_scaling = c(0.33, 1), # program was still at partial capacity for first year
+         effective_participants = total_participants/first_year_scaling, 
+         avg_subsidy = total_subsidy / total_participants,
+         effective_price = p_ashp_avg - avg_subsidy)
+
+clean_heat_ashp
+```
+
+Okay, time to fit a line to two points and hope it's realistic 😅
+
+```{r}
+ashp.model.1 <- lm(log(effective_participants) ~ log(effective_price), data = clean_heat_ashp)
+summary(ashp.model.1)
+```
+
+Overall numbers look reasonable, gotta say. Coefficients point in the correct direction, and show a lot of price sensitivity.
+
+```{r}
+qty_ashp <- function(p) {
+    ashp.model.1 %>%
+    predict(list(effective_price=p)) %>% 
+    exp
+}
+
+# weighted average of IRA subsidy across the population
+hp_ira_subsidy <- function(p) {
+  tibble(income_level = c('low','medium','high'),
+        discount_pct = c(1, .5, .3),
+        cap = c(8000, 8000, 2000),
+        price = p) %>%
+    inner_join(ny_ira_income_buckets, by = 'income_level') %>%
+    mutate(ira_subsidy = pmin(discount_pct*price, cap),
+           ira_subsidy_eff = ira_subsidy * pct) %>%
+    pull(ira_subsidy_eff) %>% sum()
+}
+
+s_ashp <- tibble(subsidy_avg = seq(0, 11000, length.out = 11),
+                  qty_no_subsidy = qty_ashp(p_ashp_avg - hp_ira_subsidy(p_ashp_avg)),
+                  qty_w_subsidy = qty_ashp(p_ashp_avg - (hp_ira_subsidy(p_ashp_avg) + subsidy_avg)),
+                  incremental_qty = qty_w_subsidy - qty_no_subsidy,
+                  subsidy_expense = (qty_w_subsidy * subsidy_avg) %>% as_units("dollars"),
+                  good = "HeatPump",
+                  ghg_saved = g_ashp * incremental_qty,
+                  ghg_saved_per_dollar = ghg_saved / subsidy_expense) %>%
+                  unite(program, c(good, subsidy_avg), remove = FALSE)
+
+s_ashp
+```
+
+The data for GSHP and multifamily are both sparser, only a few _hundred_ rebates claimed over all time vs > 20k for ASHP. I think they will be too noisy so we should skip for now.
 
 ### Weatherization Subsidies
 
-What drives the purchase of weatherization, besides buying a heat pump?
+For weatherization, let's do something very simple. This is obviously the loosest item in this analysis, but there's basically no good data here so I needed to make some rough estimates. 
+
+I estimate that a typical weatherization project costs about \$10,000 in New York State. We've had about 10,000 subsidized per year by Comfort Home for the past few years, with a typical subsidy of \$2,500 bringing the price down to \$7,500. I think if it only cost \$2,000, you'd see about 50,000 per year instead. So, pulling those numbers together,
+
+```{r}
+p_weatherization_avg <- 10000
+
+weatherization <- tibble(qty = c(10000, 50000), 
+                         sticker_price = p_weatherization_avg,
+                         subsidy = c(2500, 8000),
+                         price = sticker_price - subsidy)
+
+weatherization.model.1 <- lm(log(qty) ~ log(price), data = weatherization)
+summary(weatherization.model.1)
+```
+According to the DOE, weatherization reduces energy bills by about 20%.
+
+Using our CO2e estimates from natural gas, let's assume that we basically just cut people's natural gas bill by 20%. In reality, we should see synergistic effects with heat pumps, but to keep it simple we're keeping them separate.
+
+```{r}
+g_weatherization <- (10*furnace_yearly_kg)*.2
+
+qty_weatherization <- function(p) {
+    weatherization.model.1 %>%
+    predict(list(price=p)) %>% 
+    exp
+}
+
+# weighted average of IRA subsidy across the population
+# weirdly, there is a better discount for medium income households,
+# since they get both the upfront discount and will benefit from the tax
+# credit, whereas low income households only will benefit from their rebate
+weatherization_ira_subsidy <- function(p) {
+  tibble(income_level = c('low','medium','high'),
+        discount_pct = c(1, .5, .3),
+        cap = c(1600, 2800, 1200),
+        price = p) %>%
+    inner_join(ny_ira_income_buckets, by = 'income_level') %>%
+    mutate(ira_subsidy = pmin(discount_pct*price, cap),
+           ira_subsidy_eff = ira_subsidy * pct) %>%
+    pull(ira_subsidy_eff) %>% sum()
+}
+
+s_weatherization <- tibble(subsidy_avg = seq(0, 7000, length.out = 11),
+                  qty_no_subsidy = qty_weatherization(p_weatherization_avg - weatherization_ira_subsidy(p_weatherization_avg)),
+                  qty_w_subsidy = qty_weatherization(p_weatherization_avg - (weatherization_ira_subsidy(p_weatherization_avg) + subsidy_avg)),
+                  incremental_qty = qty_w_subsidy - qty_no_subsidy,
+                  subsidy_expense = (qty_w_subsidy * subsidy_avg) %>% as_units("dollars"),
+                  good = "Weatherization",
+                  ghg_saved = g_weatherization * incremental_qty,
+                  ghg_saved_per_dollar = ghg_saved / subsidy_expense) %>%
+                  unite(program, c(good, subsidy_avg), remove = FALSE)
+
+s_weatherization
+```
+
+Sweet! That actually makes decent sense.
 
 ### EV Subsidies
 
-Let's start by looking at the EV data from NYSERDA
+For EVs, thankfully we also have per-unit data from NYSERDA's Drive Clean program.
 
 ```{r}
 # https://data.ny.gov/Energy-Environment/NYSERDA-Electric-Vehicle-Drive-Clean-Rebate-Data-B/thd2-fu8y
 raw_ev_data <- read_csv("/mnt/data/NYSERDA_Electric_Vehicle_Drive_Clean_Rebate_Data__Beginning_2017.csv")
+fed_ev_tax_credit <-
 
 raw_ev_data
 ```
-
-Some immediate issues:
-* Doesn't contain the cost of the car itself. Do we need to join that in? Or can we build an analysis just based on the subsidy amount?
-* I think we need the Federal tax subsidy just like we have for rooftop solar
-* Does the fact that there is a clear substitute good (gasoline cars) change how we do this analysis?
-
-Some EDA
 
 ```{r}
 raw_ev_data %>%
@@ -211,10 +430,21 @@ raw_ev_data %>%
   summarise(n = n(),
             total_ghg = sum(`Annual GHG Emissions Reductions (MT CO2e)`),
             total_rebate = sum(`Rebate Amount (USD)`, na.rm = TRUE),
+            missing_rebates = sum(is.na(`Rebate Amount (USD)`)*1.),
             dollars_per_rebate = total_rebate/n)
 ```
+How have the subsidies themselves changed over time?
 
-Load car price data
+```{r}
+raw_ev_data %>%
+  mutate(submitted_date = mdy(`Submitted Date`),
+         Year = year(submitted_date)) %>%
+  group_by(Year, `EV Type`) %>%
+  ggplot(aes(x=Year, fill=`EV Type`)) + geom_bar()
+```
+Note that the 2022 data are censored, since this was collected in September 2022. Also the Federal tax rebates changed mid-year.
+
+Let's load car price data, so we can estimate how big the impact of subsides has been. This data was purchased by a database maker who provides databases prices and trim for all car types for the last few decades. Thankfully they have a less expensive database of just EV and hybrid cars.
 
 ```{r}
 # https://www.teoalida.com/cardatabase/year-make-model-trim-specs/
@@ -242,24 +472,250 @@ car_prices %>%
   ggplot(aes(x=msrp)) +
   geom_histogram()
 ```
+
+GM and Tesla cars have had their tax rebate cut as they've become mainsteam.
+
 ```{r}
 ev_data <- raw_ev_data %>%
   mutate(submitted_date = mdy(`Submitted Date`),
          Year = year(submitted_date),
-         model_lower = tolower(Model)) %>%
+         model_lower = tolower(Model),
+         fed_tax_rebate = ifelse(`EV Type` == "BEV", 7500, 4500), # this is approximate, but close enough
+         fed_tax_rebate = ifelse((Make == "Tesla") & (submitted_date > "2019-01-01"), 3750, fed_tax_rebate),
+         fed_tax_rebate = ifelse((Make == "Tesla") & (submitted_date > "2019-07-01"), 1875, fed_tax_rebate),
+         fed_tax_rebate = ifelse((Make == "Tesla") & (submitted_date > "2020-01-01"), 0, fed_tax_rebate),
+         fed_tax_rebate = ifelse((Make == "Chevrolet") & (submitted_date > "2019-04-01"), 3750, fed_tax_rebate),
+         fed_tax_rebate = ifelse((Make == "Chevrolet") & (submitted_date > "2019-10-01"), 1875, fed_tax_rebate),      
+         fed_tax_rebate = ifelse((Make == "Chevrolet") & (submitted_date > "2020-04-01"), 0, fed_tax_rebate),
+         fed_tax_rebate = ifelse((Make == "Cadillac") & (submitted_date > "2019-04-01"), 3750, fed_tax_rebate),
+         fed_tax_rebate = ifelse((Make == "Cadillac") & (submitted_date > "2019-10-01"), 1875, fed_tax_rebate),      
+         fed_tax_rebate = ifelse((Make == "Cadillac") & (submitted_date > "2020-04-01"), 0, fed_tax_rebate),
+         ) %>%
   left_join(car_prices, by=c('Make','model_lower','Year')) # nb calendar year != make year, but close enough
 
 # Coverage?
 1-mean(is.na(ev_data$msrp)*1.)
 ```
 
-Thoughts:
-* From the EPA combined mileage, we could calculate the average yearly cost to fuel each car, and similar for maintenance from some third party source; do we need that kind of cross elasticity estimate to get a good demand function? 
-  * No, I think just using gas prices as a demand shifter is probably enough, so we need annual average gas prices
-  * Do we separate into low, mid, lux tiers and estimate from there?
+```{r}
+ev_data %>%
+  filter(is.na(msrp)) %>%
+  group_by(Make, Model) %>%
+  count() %>%
+  mutate(pct = 100*(n/nrow(ev_data))) %>%
+  arrange(-n)
+```
+
+For our long tail of missing msrps, impute the msrp by the average for the Make.
+
+```{r}
+make_prices <- car_prices %>%
+  group_by(Make) %>%
+  summarise(make_msrp = median(msrp))
+
+ev_data <- ev_data %>%
+  left_join(make_prices, by=c('Make'))
+```
+
+Before we finis the imputing, would does that do on the ones we have data on? We can remove Tesla since they have such a huge cost range, and we have costs for all of them.
+
+```{r}
+summary(lm(msrp ~ make_msrp, data=ev_data %>% filter(Make != "Tesla")))
+```
+
+Seems like a decent formula, we can just use that.
+
+```{r}
+# Impute missing prices by make
+ev_data <- ev_data %>%
+  mutate(msrp = coalesce(msrp, 0.94*make_msrp + 4044))
+```
+
+At first I was going to control for gas prices per year, but it doesn't have much of an impact, so I'm cutting it.
+
+```{r}
+# # gas prices are from https://www.nyserda.ny.gov/Researchers-and-Policymakers/Energy-Prices/Motor-Gasoline/Monthly-Average-Motor-Gasoline-Prices
+# gas_prices <- read_csv("/mnt/data/ny_gas_prices.csv") %>%
+#   drop_na() %>%
+#   pivot_longer(cols = -Month, names_to = "Year", values_to = "Price") %>%
+#   group_by(Year) %>%
+#   summarise(avg_gas_price = mean(Price)) %>%
+#   mutate(Year = as.numeric(Year))
+# 
+# gas_prices# gas prices are from https://www.nyserda.ny.gov/Researchers-and-Policymakers/Energy-Prices/Motor-Gasoline/Monthly-Average-Motor-Gasoline-Prices
+# gas_prices <- read_csv("/mnt/data/ny_gas_prices.csv") %>%
+#   drop_na() %>%
+#   pivot_longer(cols = -Month, names_to = "Year", values_to = "Price") %>%
+#   group_by(Year) %>%
+#   summarise(avg_gas_price = mean(Price)) %>%
+#   mutate(Year = as.numeric(Year))
+# 
+# gas_prices
+```
+
+After all that work, we're just taking an average msrp and tax rebate, and fitting the standard model. Could probably have saved ourselves some time by just doing e.g. one car, but so it goes.
+
+```{r}
+ev_demand <- ev_data %>% 
+  group_by(Year) %>%
+  summarise(qty = n(),
+            msrp = mean(msrp, na.rm = TRUE),
+            subsidy = mean(`Rebate Amount (USD)`, na.rm = TRUE),
+            fed_tax = mean(fed_tax_rebate),
+            price = msrp - (subsidy + fed_tax)) %>%
+  mutate(adj_tax_year = Year - 2015)
+
+ev_demand %>%
+  ggplot(aes(x=price, y=qty, label=Year)) + geom_label()
+```
+```{r}
+ev.model.1 <- lm(log(qty) ~ log(price) + log(adj_tax_year), data=ev_demand)
+
+summary(ev.model.1)
+```
+
+Really strong predictive value. `log(price)` isn't significant, but it points in the correct direction, and seems like it shows correctly that price is not the main driver at the moment, so let's go with that for now. Subsidies haven't moved around enough to call this a natural experiment, and prices are clearly derived from near-equilibrium situations unlike with solar panels, so this is doubly suspect. However, eyeballing the graph below, it looks like it's not a terrible predictor.
+
+```{r}
+qty_ev <- function(p) {predict(ev.model.1, list(adj_tax_year=replicate(length(p), 8), price=p)) %>% exp}
+
+ev_demand %>% 
+  ggplot(aes(x=price, y=qty, label=Year)) +
+  geom_function(fun = ~ (qty_ev(.x)), color='green') +
+  geom_point() + geom_label() +
+  xlab("Average final price") +
+  ylab("Qty")
+```
+
+What's our average final price for 2022?
+
+```{r}
+ev_prices_2022 <- ev_data %>% 
+  filter(Year == 2022) %>%
+  group_by(Year) %>%
+  summarise(msrp = mean(msrp, na.rm=TRUE),
+            subsidy = mean(`Rebate Amount (USD)`, na.rm=TRUE),
+            fed_tax_rebate = mean(fed_tax_rebate),
+            avg_price = msrp - (subsidy + fed_tax_rebate),
+            avg_ghg_kg = 1000*mean(`Annual GHG Emissions Reductions (MT CO2e)`))
+
+ev_prices_2022
+```
+
+Surprising how few cars sold are taking advantage of the federal rebate, but I guess that's just the power of Tesla and GM.
+
+Let's calculate the subsidy impacts for next year
+
+```{r}
+p_ev_base <- ev_prices_2022$msrp[[1]]
+# https://www.epa.gov/energy/greenhouse-gases-equivalencies-calculator-calculations-and-references
+g_ice <- 10*4640 # 10 years at national average kg CO2
+
+# kWh/mi for EV
+# https://ecocostsavings.com/average-electric-car-kwh-per-mile/#:~:text=The%20average%20electric%20car%20kWh%20per%20100%20miles%20(kWh%2F100,kWh%20to%20travel%201%20mile.
+kwh_mi <- 0.346
+# VMT for US
+# 11520 VMT
+g_ev <- g_ice - 10*11520*kwh_mi
+
+s_ev <- tibble(subsidy = seq(0, 10000, length.out = 11),
+                qty_no_subsidy = qty_ev(p_ev_base),
+                qty_w_subsidy = qty_ev(p_ev_base - subsidy), # e.g. 2023 fed tax rebate is effectively 0 for next year
+                incremental_qty = qty_w_subsidy - qty_no_subsidy,
+                subsidy_expense = qty_w_subsidy * subsidy * 1.2,
+                good = "EV",
+                ghg_saved = g_ev * incremental_qty,
+                ghg_saved_per_dollar = ghg_saved / subsidy_expense) %>%
+                unite(program, c(good, subsidy), remove = FALSE)
+
+s_ev %>%
+  ggplot(aes(x = subsidy, y = ghg_saved)) +
+  geom_line() +
+  xlim(c(0, 10000)) +
+  xlab("Avg subsidy ($))") +
+  ylab("CO2 reduction")
+```
+
+
+## Budget optimization
+
+```{r}
+s <- rbind(s_solar %>% select(good, program, subsidy_expense, ghg_saved, ghg_saved_per_dollar, qty_w_subsidy),
+           s_ev %>% select(good, program, subsidy_expense, ghg_saved, ghg_saved_per_dollar, qty_w_subsidy),
+           s_ashp %>% select(good, program, subsidy_expense, ghg_saved, ghg_saved_per_dollar, qty_w_subsidy),
+           s_weatherization %>% select(good, program, subsidy_expense, ghg_saved, ghg_saved_per_dollar, qty_w_subsidy))
+
+s <- drop_units(s)
+s
+```
+
+```{r}
+optimize_budget <- function(B, s) {
+  num_programs <- s %>% count(good) %>% nrow()
+
+  # goal: maximize ghg saved
+  f.obj <- pull(s, ghg_saved)
   
-Separate into low, mid, lux. Calculate 5-year TCO. Subtract subsidies (state and federal). Fit model to log(qty) vs log(total price) + log(gas).
+  # subject to the following constraints
+  f.con <- matrix(c(s$subsidy_expense, # budget for each level
+            ifelse(pull(s, good) == "Solar", 1, 0), # must pick one level per program
+            ifelse(pull(s, good) == "EV", 1, 0), # tk make this more automated
+            ifelse(pull(s, good) == "HeatPump", 1, 0),
+            ifelse(pull(s, good) == "Weatherization", 1, 0)),
+            nrow=5, byrow = TRUE)
+  
+  f.dir <- c("<=", replicate(num_programs, "="))
+  f.rhs <- c(B, replicate(num_programs, 1))
+  
+  # We run the optimization, using integer programming magic.
+  lp(direction = "max",
+              f.obj,
+              f.con,
+              f.dir,
+              f.rhs,
+              all.bin = TRUE)
+}
+```
 
-### Chaging Station Subsidies
 
-Where is there data on this?
+```{r}
+B = 1e9
+
+optim.1.1b <- optimize_budget(B, s)
+```
+
+```{r}
+s$program[optim.1.1b$solution == 1]
+```
+
+```{r}
+clean_result <- function(s, o, B) {
+  tibble(budget = scales::dollar(B),
+         name = s$program[o$solution == 1], 
+        amount = s$subsidy_expense[o$solution == 1],
+        mtghg = s$ghg_saved[o$solution == 1] / 1e6,
+        qty = s$qty_w_subsidy[o$solution == 1]) %>%
+    mutate(pct = scales::percent(amount/sum(amount)),
+         amount = scales::dollar(amount),
+         mtghg = scales::comma(mtghg),
+         qty = scales::comma(qty))
+}
+
+clean_result(s, optimize_budget(B, s), B)
+```
+
+And now at different budget levels:
+
+```{r}
+out <- c()
+
+for (B in c(.25e9, .5e9, 1e9, 2e9, 3e9, 4e9, 5e9, 6e9, 7e9, 8e9, 9e9, 10e9)) {
+  out <- rbind(out, clean_result(s, optimize_budget(B, s), B))
+}
+
+out
+```
+
+```{r}
+write_csv(out, "/mnt/output/budget_estimates_2022-10-14.csv")
+```
